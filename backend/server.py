@@ -1,60 +1,107 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
 from typing import List
-import uuid
-from datetime import datetime
+import stripe
 
+# Import our models and services
+from models import (
+    Book, BookListResponse, Order, OrderCreate, OrderResponse, 
+    Review, Author, PaymentIntentCreate, PaymentIntentResponse, 
+    PaymentConfirm, ApiResponse
+)
+from database import connect_to_mongo, close_mongo_connection
+from services.book_service import BookService
+from services.order_service import OrderService
+from services.stripe_service import StripeService
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
-
-# Create the main app without a prefix
-app = FastAPI()
+# Create the main app
+app = FastAPI(
+    title="Ebooks API", 
+    description="API for María Fernández's ebook store",
+    version="1.0.0"
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Initialize services
+book_service = BookService()
+order_service = OrderService()
+stripe_service = StripeService()
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+# Startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    await connect_to_mongo()
+    logging.info("Application started successfully")
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_mongo_connection()
+    logging.info("Application shutdown complete")
 
-# Add your routes to the router instead of directly to app
+# Root endpoint
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Ebooks API is running", "version": "1.0.0"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
+# Book endpoints
+@api_router.get("/books", response_model=BookListResponse)
+async def get_books():
+    """Get all books"""
+    try:
+        books = await book_service.get_all_books()
+        return BookListResponse(books=books, total=len(books))
+    except Exception as e:
+        logging.error(f"Error getting books: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+@api_router.get("/books/{book_id}", response_model=Book)
+async def get_book(book_id: str):
+    """Get a specific book by ID"""
+    try:
+        book = await book_service.get_book_by_id(book_id)
+        if not book:
+            raise HTTPException(status_code=404, detail="Libro no encontrado")
+        return book
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error getting book {book_id}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+@api_router.get("/books/category/{category}")
+async def get_books_by_category(category: str):
+    """Get books by category"""
+    try:
+        books = await book_service.get_books_by_category(category)
+        return {"books": books, "total": len(books), "category": category}
+    except Exception as e:
+        logging.error(f"Error getting books by category {category}: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
+
+@api_router.get("/books/featured/bestsellers")
+async def get_bestsellers():
+    """Get bestseller books"""
+    try:
+        books = await book_service.get_bestsellers()
+        return {"books": books, "total": len(books)}
+    except Exception as e:
+        logging.error(f"Error getting bestsellers: {e}")
+        raise HTTPException(status_code=500, detail="Error interno del servidor")
 
 # Include the router in the main app
 app.include_router(api_router)
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -69,7 +116,3 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
